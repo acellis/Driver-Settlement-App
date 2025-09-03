@@ -342,6 +342,244 @@ function OwnerLoadsTable({state,drivers,data,setData}){
     </tbody>
   </table>;
 }
+function OwnerPayouts({ state }) {
+  const [cycleIdx, setCycleIdx] = React.useState(0);
+  const cycles = listCycles(state.startWeekday, 6, 26, new Date());
+  const cycle = cycles[cycleIdx];
+  const cutoffHour = state.cutoffHour ?? 15;
+
+  const [rows, setRows] = React.useState([]);
+  const [loading, setLoading] = React.useState(false);
+  const [err, setErr] = React.useState(null);
+
+  const isSupa =
+    typeof supabase !== "undefined" &&
+    !!import.meta.env.VITE_SUPABASE_URL &&
+    !!import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+  React.useEffect(() => {
+    (async () => {
+      setLoading(true);
+      setErr(null);
+      try {
+        let drivers = [];
+        let loads = [];
+
+        if (isSupa) {
+          const { data: d, error: dErr } = await supabase
+            .from("drivers")
+            .select("*")
+            .order("name");
+          if (dErr) throw dErr;
+          drivers = d || [];
+
+          const { data: l, error: lErr } = await supabase
+            .from("loads")
+            .select("*")
+            .gte("delivered_at", cycle.cycleStart.toISOString())
+            .lte("delivered_at", cycle.cycleEnd.toISOString());
+          if (lErr) throw lErr;
+          loads = l || [];
+        } else {
+          // Local fallback (uses MVP state)
+          drivers = state.drivers || [];
+          // flatten local loads
+          for (const d of drivers) {
+            const arr = (state.data?.[d.id]?.loads || []).map((x) => ({
+              ...x,
+              driver_id: d.id,
+              delivered_at: x.deliveredAt?.toISOString?.() || null,
+              bol_at: x.bolAt?.toISOString?.() || null,
+              dispatch_pct: x.dispatchPct ?? x.dispatch_pct ?? d.defaultDispatchPct ?? d.default_dispatch_pct ?? 0,
+              owner_override: x.ownerOverride ?? x.owner_override ?? null,
+              load_no: x.loadNo ?? x.load_no ?? "",
+            }));
+            loads.push(...arr);
+          }
+        }
+
+        // Group & compute
+        const byDriver = new Map(drivers.map((d) => [d.id, { driver: d, loads: [] }]));
+        for (const l of loads) {
+          const bucket = byDriver.get(l.driver_id);
+          if (bucket) bucket.loads.push(l);
+        }
+
+        const out = [];
+        for (const { driver, loads: ls } of byDriver.values()) {
+          const computed = ls.map((l) => {
+            const deliveredAt = new Date(l.delivered_at ?? l.deliveredAt);
+            const bolAt = l.bol_at ? new Date(l.bol_at) : (l.bolAt ? new Date(l.bolAt) : null);
+
+            const inWindow = deliveredAt >= cycle.cycleStart && deliveredAt <= cycle.cycleEnd;
+            const late = bolAt ? (bolAt.getHours() > cutoffHour || (bolAt.getHours() === cutoffHour && bolAt.getMinutes() > 0)) : true;
+            const autoIncluded = inWindow && !late;
+
+            let included = autoIncluded;
+            if (l.owner_override === "include") included = true;
+            if (l.owner_override === "exclude") included = false;
+
+            const revenue = Number(l.revenue || 0);
+            const fuel = Number(l.fuel || 0);
+            const misc = Number(l.misc || 0);
+            const pct = Number((l.dispatch_pct ?? l.dispatchPct ?? driver.default_dispatch_pct ?? driver.defaultDispatchPct ?? 0) || 0);
+            const dispatchFee = (pct / 100) * revenue;
+            const net = revenue - fuel - misc - dispatchFee;
+
+            return { deliveredAt, inWindow, included, revenue, fuel, misc, pct, dispatchFee, net };
+          });
+
+          const inc = computed.filter((x) => x.included && x.inWindow);
+          const gross = inc.reduce((a, x) => a + x.revenue, 0);
+          const fuel = inc.reduce((a, x) => a + x.fuel, 0);
+          const misc = inc.reduce((a, x) => a + x.misc, 0);
+          const dispatch = inc.reduce((a, x) => a + x.dispatchFee, 0);
+          const net = inc.reduce((a, x) => a + x.net, 0);
+          const lease = Number(driver.lease || 0);
+          const final = net - lease;
+
+          out.push({
+            id: driver.id,
+            name: driver.name || driver.email || "(unnamed)",
+            lease,
+            counts: inc.length,
+            gross,
+            fuel,
+            misc,
+            dispatch,
+            net,
+            final,
+          });
+        }
+
+        // Sort by name for stable UI
+        out.sort((a, b) => a.name.localeCompare(b.name));
+        setRows(out);
+      } catch (e) {
+        console.error(e);
+        setErr(e.message || String(e));
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [cycleIdx, state.startWeekday, state.cutoffHour]);
+
+  const exportCSV = () => {
+    const header = ["Driver", "Loads", "Gross", "Fuel", "Misc", "Dispatch", "Net (pre-lease)", "Lease", "Final Owed"];
+    const body = rows.map((r) => [
+      r.name,
+      r.counts,
+      r.gross,
+      r.fuel,
+      r.misc,
+      r.dispatch,
+      r.net,
+      r.lease,
+      r.final,
+    ]);
+    const totals = rows.reduce(
+      (a, r) => ({
+        c: a.c + r.counts,
+        g: a.g + r.gross,
+        f: a.f + r.fuel,
+        m: a.m + r.misc,
+        d: a.d + r.dispatch,
+        n: a.n + r.net,
+        l: a.l + r.lease,
+        o: a.o + r.final,
+      }),
+      { c: 0, g: 0, f: 0, m: 0, d: 0, n: 0, l: 0, o: 0 }
+    );
+    const totalsRow = ["Totals", totals.c, totals.g, totals.f, totals.m, totals.d, totals.n, totals.l, totals.o];
+    const csv = [header, ...body, [], totalsRow].map((r) => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `payouts_${toLocalDateInput(cycle.cycleEnd)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const totals = rows.reduce(
+    (a, r) => ({
+      c: a.c + r.counts,
+      g: a.g + r.gross,
+      f: a.f + r.fuel,
+      m: a.m + r.misc,
+      d: a.d + r.dispatch,
+      n: a.n + r.net,
+      l: a.l + r.lease,
+      o: a.o + r.final,
+    }),
+    { c: 0, g: 0, f: 0, m: 0, d: 0, n: 0, l: 0, o: 0 }
+  );
+
+  return (
+    <Card>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
+        <label>
+          Period
+          <select value={cycleIdx} onChange={(e) => setCycleIdx(Number(e.target.value))} style={{ ...ibox, width: 360, marginLeft: 8 }}>
+            {cycles.map((c, idx) => (
+              <option key={idx} value={idx}>
+                {c.cycleStart.toDateString()} → {c.cycleEnd.toDateString()} (Pay {c.payDate.toDateString()})
+              </option>
+            ))}
+          </select>
+        </label>
+        <span style={{ marginLeft: "auto" }}>
+          <span style={pill()}>Cutoff {cutoffHour}:00</span>
+        </span>
+        <button onClick={exportCSV} style={btn}>Export CSV</button>
+      </div>
+
+      {err && <div style={{ color: "#b91c1c", marginBottom: 8 }}>Error: {String(err)}</div>}
+      {loading ? <div>Loading…</div> : (
+        <table style={tableStyle}>
+          <thead>
+            <tr>
+              {["Driver", "Loads", "Gross", "Fuel", "Misc", "Dispatch", "Net (pre-lease)", "Lease", "Final Owed"].map((h) => (
+                <th key={h} style={thStyle}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id}>
+                <td style={tdStyle}>{r.name}</td>
+                <td style={tdStyle}>{r.counts}</td>
+                <td style={tdStyle}>{fmtUSD(r.gross)}</td>
+                <td style={tdStyle}>{fmtUSD(r.fuel)}</td>
+                <td style={tdStyle}>{fmtUSD(r.misc)}</td>
+                <td style={tdStyle}>{fmtUSD(r.dispatch)}</td>
+                <td style={tdStyle}>{fmtUSD(r.net)}</td>
+                <td style={tdStyle}>{fmtUSD(r.lease)}</td>
+                <td style={{ ...tdStyle, fontWeight: 700 }}>{fmtUSD(r.final)}</td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr><td colSpan={9} style={tdStyle}>No included loads for this period.</td></tr>
+            )}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td style={tdStyle}><b>Totals</b></td>
+              <td style={tdStyle}>{totals.c}</td>
+              <td style={tdStyle}>{fmtUSD(totals.g)}</td>
+              <td style={tdStyle}>{fmtUSD(totals.f)}</td>
+              <td style={tdStyle}>{fmtUSD(totals.m)}</td>
+              <td style={tdStyle}>{fmtUSD(totals.d)}</td>
+              <td style={tdStyle}>{fmtUSD(totals.n)}</td>
+              <td style={tdStyle}>{fmtUSD(totals.l)}</td>
+              <td style={{ ...tdStyle, fontWeight: 800 }}>{fmtUSD(totals.o)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      )}
+    </Card>
+  );
+}
 
 // ---------- DRIVER (Supabase auth) ----------
 function DriverLogin(){
@@ -535,6 +773,7 @@ function App(){
   if(route==="/admin"){
     return (<div style={{fontFamily:"Inter, system-ui, sans-serif", maxWidth:1150, margin:"22px auto"}}>
       <OwnerAuthGate state={state} setState={setState}>
+        <Section title="Weekly Payouts"> <OwnerPayouts state={state} /> </Section>
         <Section title="Settings"><OwnerSettings state={state} setState={setState}/></Section>
         <Section title="Drivers"><OwnerAdmin drivers={drivers} setDrivers={setDrivers}/></Section>
         <Section title="Add Load"><OwnerAddLoad drivers={drivers} setData={setData} state={state}/></Section>
