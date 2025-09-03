@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { createClient } from "@supabase/supabase-js";
 
 /** ========================
- * Driver Settlement v5 (Supabase-enabled)
+ * Driver Settlement v6 (Supabase-enabled from V5)
  * - NEW: Optional Supabase backend for multi-device sharing.
  *   If VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY exist, the app
  *   runs in "Supabase mode":
@@ -12,8 +12,11 @@ import { createClient } from "@supabase/supabase-js";
  *   Otherwise it falls back to localStorage mode (v4 behavior).
  * - Hash routes: #/admin (owner), #/driver (driver)
  * - Error boundary + BUILD flag to avoid white screens
+ * - In V6 added how much is owed to each driver per cycle, moe visually appealing UI for owner portal, and only counteed loads if revenue > 0
  * ======================== */
 
+// A row is a "load" only if it has revenue
+const isLoadRow = (l) => Number(l.revenue || 0) > 0;
 // ---- DEV BUILD FLAG ----
 const BUILD_FLAG = "driver-app v5.0 / supabase / 2025-08-27";
 window.__DRIVER_APP_BUILD__ = BUILD_FLAG;
@@ -169,7 +172,12 @@ function OwnerAuthGate({state,setState,children}){
   }
   // ---- Local fallback password gate (kept from v4) ----
   const [pw,setPw]=useState(""); const [newPw,setNewPw]=useState(""); const authed=sessionStorage.getItem("ownerAuthed")==="1";
-  async function sha256Hex(str){ const enc=new TextEncoder(); const buf=await crypto.subtle.digest("SHA-256", enc.encode(str)); return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,"0")).join('\n'); }
+// hex string must not include newlines
+async function sha256Hex(str){
+  const enc = new TextEncoder();
+  const buf = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2,"0")).join('');
+}
   if(!state.ownerPasswordHash){
     const setup=async()=>{ if((newPw||"").length<8) return alert("Use at least 8 characters."); const hash=await sha256Hex(newPw); setState({...state, ownerPasswordHash:hash}); sessionStorage.setItem("ownerAuthed","1"); };
     return <Card><div style={{display:"flex",gap:12,alignItems:"end",flexWrap:"wrap"}}><div><label>Create Owner Password<br/><input type="password" value={newPw} onChange={e=>setNewPw(e.target.value)} style={ibox}/></label></div><button onClick={setup} style={btnPrimary}>Save & Enter Owner Portal</button></div><div style={{marginTop:8,fontSize:12,color:"#6b7280"}}>Local-only (no backend). For a shared portal, configure Supabase.</div></Card>;
@@ -297,6 +305,7 @@ function OwnerLoadsTable({state,drivers,data,setData}){
   const cutoffHour=state.cutoffHour??15;
   const active=drivers[0];
   const loads=active?(data[active.id]?.loads||[]):[];
+
   const rows=loads.map(l=>{
     const late = isDate(l.bolAt) ? (l.bolAt.getHours()>cutoffHour || (l.bolAt.getHours()===cutoffHour && l.bolAt.getMinutes()>0)) : true;
     const inWindow = isDate(l.deliveredAt) ? (l.deliveredAt>=cycle.cycleStart && l.deliveredAt<=cycle.cycleEnd) : false;
@@ -304,44 +313,62 @@ function OwnerLoadsTable({state,drivers,data,setData}){
     const override = l.ownerOverride ?? l.owner_override ?? null; if(override==="include") included=true; if(override==="exclude") included=false;
     return {...l,late,inWindow,autoIncluded,included};
   });
+
   const setOverride=async(id,val)=>{
     if(supaEnabled){ await supabase.from('loads').update({ owner_override: (val==="auto"?null:val) }).eq('id', id); }
     const next=loads.map(l=>l.id===id?{...l, ownerOverride:(val==="auto"?null:val), owner_override:(val==="auto"?null:val)}:l);
     setData(prev=>({ ...prev, [active.id]:{ loads: next } }));
   };
+
   const remove=async(id)=>{
     if(!confirm("Delete this load?")) return;
     if(supaEnabled){ await supabase.from('loads').delete().eq('id', id); }
     const next=loads.filter(l=>l.id!==id); setData(prev=>({ ...prev, [active.id]:{ loads: next } }));
   };
-  return <table style={tableStyle}>
-    <thead><tr>{["Date","Load #","Origin → Dest","Revenue","Fuel","Misc","Disp %","Disp $","Net","Auto","Override","Included?","Actions"].map(h=><th key={h} style={thStyle}>{h}</th>)}</tr></thead>
-    <tbody>
-      {rows.map(l=>(<tr key={l.id}>
-        <td style={tdStyle}>{isDate(l.deliveredAt) ? l.deliveredAt.toLocaleString() : "-"}</td>
-        <td style={tdStyle}>{l.load_no||l.loadNo||"-"}</td>
-        <td style={tdStyle}>{(l.origin||"-")} → {(l.destination||"-")}</td>
-        <td style={tdStyle}>{fmtUSD(l.revenue)}</td>
-        <td style={tdStyle}>{fmtUSD(l.fuel)}</td>
-        <td style={tdStyle}>{fmtUSD(l.misc)}</td>
-        <td style={tdStyle}>{( (l.dispatch_pct ?? l.dispatchPct ?? 0).toFixed(2) )}%</td>
-        <td style={tdStyle}>{fmtUSD(l.dispatchFee)}</td>
-        <td style={tdStyle}>{fmtUSD(l.net)}</td>
-        <td style={tdStyle}>{l.autoIncluded ? <span style={pill("#dcfce7")}>auto ✓</span> : <span style={pill("#fee2e2")}>auto ✗</span>}</td>
-        <td style={tdStyle}>
-          <select value={(l.owner_override??l.ownerOverride)||"auto"} onChange={e=>setOverride(l.id,e.target.value)} style={ibox}>
-            <option value="auto">auto</option>
-            <option value="include">include</option>
-            <option value="exclude">exclude</option>
-          </select>
-        </td>
-        <td style={tdStyle}>{l.included?"Yes":"No"}</td>
-        <td style={tdStyle}><button onClick={()=>remove(l.id)} style={btnDanger}>Delete</button></td>
-      </tr>))}
-      {rows.length===0 && (<tr><td colSpan={13} style={tdStyle}>No loads yet.</td></tr>)}
-    </tbody>
-  </table>;
+
+  return (
+    <table style={tableStyle}>
+      <thead>
+        <tr>
+          {["Date","Load #","Type","Origin → Dest","Revenue","Fuel","Misc","Disp %","Disp $","Net","Auto","Override","Included?","Actions"]
+            .map(h=><th key={h} style={thStyle}>{h}</th>)}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map(l=>(
+          <tr key={l.id}>
+            <td style={tdStyle}>{isDate(l.deliveredAt) ? l.deliveredAt.toLocaleString() : "-"}</td>
+            <td style={tdStyle}>{l.load_no||l.loadNo||"-"}</td>
+            <td style={tdStyle}>
+              {Number(l.revenue||0)>0
+                ? <span style={pill("#dcfce7")}>load</span>
+                : <span style={pill("#fee2e2")}>expense</span>}
+            </td>
+            <td style={tdStyle}>{(l.origin||"-")} → {(l.destination||"-")}</td>
+            <td style={tdStyle}>{fmtUSD(l.revenue)}</td>
+            <td style={tdStyle}>{fmtUSD(l.fuel)}</td>
+            <td style={tdStyle}>{fmtUSD(l.misc)}</td>
+            <td style={tdStyle}>{((l.dispatch_pct ?? l.dispatchPct ?? 0).toFixed(2))}%</td>
+            <td style={tdStyle}>{fmtUSD(l.dispatchFee)}</td>
+            <td style={tdStyle}>{fmtUSD(l.net)}</td>
+            <td style={tdStyle}>{l.autoIncluded ? <span style={pill("#dcfce7")}>auto ✓</span> : <span style={pill("#fee2e2")}>auto ✗</span>}</td>
+            <td style={tdStyle}>
+              <select value={(l.owner_override??l.ownerOverride)||"auto"} onChange={e=>setOverride(l.id,e.target.value)} style={ibox}>
+                <option value="auto">auto</option>
+                <option value="include">include</option>
+                <option value="exclude">exclude</option>
+              </select>
+            </td>
+            <td style={tdStyle}>{l.included?"Yes":"No"}</td>
+            <td style={tdStyle}><button onClick={()=>remove(l.id)} style={btnDanger}>Delete</button></td>
+          </tr>
+        ))}
+        {rows.length===0 && (<tr><td colSpan={13} style={tdStyle}>No loads yet.</td></tr>)}
+      </tbody>
+    </table>
+  );
 }
+
 function OwnerPayouts({ state }) {
   const [cycleIdx, setCycleIdx] = React.useState(0);
   const cycles = listCycles(state.startWeekday, 6, 26, new Date());
@@ -442,7 +469,7 @@ function OwnerPayouts({ state }) {
             id: driver.id,
             name: driver.name || driver.email || "(unnamed)",
             lease,
-            counts: inc.length,
+             counts: inc.filter(x => Number(x.revenue||0) > 0).length, // only rows with revenue are “loads”
             gross,
             fuel,
             misc,
@@ -635,8 +662,8 @@ function DriverCyclesView({state,driver,loads}){
   const finalRow  = ["","","","","","","","Lease",-(driver.lease||0),totals.final];
 
   const csv = [header, ...body, [], totalsRow, finalRow]
-    .map(r => r.join('\n'))
-    .join('\n');     // <-- keep this on one line
+    .map(r => r.join(','))   // fields separated by commas
+    .join('\n');             // rows separated by newlines
   const blob = new Blob([csv], { type: 'text/csv' });
   const url  = URL.createObjectURL(blob);
   const a = document.createElement('a');
